@@ -18,10 +18,14 @@
 #include"llvm/IR/Type.h"
 #include"llvm/IR/Verifier.h"
 #include"llvm/IR/PassManager.h"
+#include"llvm/IR/LegacyPassManager.h"
 #include"llvm/Passes/PassBuilder.h"
 #include"llvm/Passes/StandardInstrumentations.h"
 #include"llvm/Support/TargetSelect.h"
 #include"llvm/Target/TargetMachine.h"
+#include"llvm/Target/TargetOptions.h"
+#include"llvm/TargetParser/Host.h"
+#include"llvm/MC/TargetRegistry.h"
 #include"llvm/Transforms/InstCombine/InstCombine.h"
 #include"llvm/Transforms/Scalar.h"
 #include"llvm/Transforms/Scalar/GVN.h"
@@ -259,8 +263,10 @@ static int GetTokPrecedence() {
     return TokPrec;
 }
 
+static bool HasError = false;
 std::unique_ptr<ExprAST> LogError(const char* Str) {
     fprintf(stderr, "Error: %s\n", Str);
+    HasError = true;
     return nullptr;
 }
 
@@ -578,6 +584,9 @@ static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static ExitOnError ExitOnErr;
 static std::map<std::string,std::unique_ptr<PrototypeAST>> FunctionProtos;
 
+static bool EmitObject = false;
+static TargetMachine* TheTM;
+
 Value* LogErrorV(const char * Str) {
     LogError(Str);
     return nullptr;
@@ -838,7 +847,10 @@ Function* FunctionAST::codegen() {
 static void InitializeModuleAndManagers() {
     TheContext = std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("Kaleidoscope",*TheContext);
-    TheModule->setDataLayout(TheJIT->getDataLayout());
+    if(EmitObject) {
+        TheModule->setDataLayout(TheTM->createDataLayout());
+        TheModule->setTargetTriple(TheTM->getTargetTriple());
+    } else TheModule->setDataLayout(TheJIT->getDataLayout());
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 
     TheFPM = std::make_unique<FunctionPassManager>();
@@ -869,8 +881,10 @@ static void HandleDefinition() {
             FnIR->print(errs());
             fprintf(stderr,"\n");
 
-            ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule),std::move(TheContext))));
-            InitializeModuleAndManagers();
+            if(!EmitObject) {
+                ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule),std::move(TheContext))));
+                InitializeModuleAndManagers();
+            }
         }
     }
     else getNextToken();
@@ -891,7 +905,7 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
     if(auto FnAST = ParseTopLevelExpr()) {
-        if(FnAST->codegen()) {
+        if(FnAST->codegen() && !EmitObject) {
             auto RT = TheJIT->getMainJITDylib().createResourceTracker();
             auto TSM = ThreadSafeModule(std::move(TheModule),std::move(TheContext));
             ExitOnErr(TheJIT->addModule(std::move(TSM),RT));
@@ -939,7 +953,7 @@ extern "C" DLLEXPORT double printd(double X) {
 }
 
 //=== Driver
-int main()
+int main(int argc, char* argv[])
 {
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
@@ -951,22 +965,65 @@ int main()
     BinopPrecedence['-'] = 20;
     BinopPrecedence['*'] = 40;
 
+    std::string OutputFile;
+    if(argc == 2) {
+        EmitObject = true;
+        std::string InputFile = argv[1];
+        OutputFile = InputFile + ".o";
+        if(!freopen(InputFile.c_str(),"r",stdin)) {
+            errs() << "Could not open input file: " << InputFile;
+            return 1;
+        }
+
+        Triple TargetTriple(sys::getDefaultTargetTriple());
+        std::string Error;
+        auto Target = TargetRegistry::lookupTarget(TargetTriple,Error);
+        if(!Target) {
+            errs() << Error;
+            return 1;
+        }
+
+        TargetOptions Opt;
+        TheTM = Target->createTargetMachine(TargetTriple,"generic","",Opt,Reloc::PIC_);
+    } else {
+        TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+        auto G = cantFail(
+            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                TheJIT->getDataLayout().getGlobalPrefix()
+            )
+        );
+        TheJIT->getMainJITDylib().addGenerator(std::move(G));
+    }
+
     fprintf(stderr,"ready> ");
     getNextToken();
-
-    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
-    auto G = cantFail(
-        llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            TheJIT->getDataLayout().getGlobalPrefix()
-        )
-    );
-    TheJIT->getMainJITDylib().addGenerator(std::move(G));
 
     InitializeModuleAndManagers();
 
     MainLoop();
 
-    TheModule->print(errs(),nullptr);
+    if(EmitObject) {
+        if(HasError) {
+            errs() << "Compile error!";
+            return 1;
+        }
 
+        std::error_code EC;
+        raw_fd_ostream Dest(OutputFile,EC,sys::fs::OF_None);
+        if(EC) {
+            errs() << "Could not open output file: " << EC.message();
+            return 1;
+        }
+
+        legacy::PassManager Pass;
+        if(TheTM->addPassesToEmitFile(Pass,Dest,nullptr,CodeGenFileType::ObjectFile)) {
+            errs() << "Could not emit object of this type";
+            return 1;
+        }
+
+        Pass.run(*TheModule);
+        Dest.flush();
+    }
+    
     return 0;
 }
